@@ -1533,6 +1533,252 @@ fn set_paused_by_non_admin_rejected() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #49 — Minimum deposit amount config
+// ---------------------------------------------------------------------------
+
+/// With no minimum ever configured (defaults to `0`), a small deposit
+/// succeeds.
+#[test]
+fn min_deposit_defaults_to_no_minimum() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const TINY: i128 = 1;
+    mint(&env, &token, &token_admin, &user, TINY);
+    client.deposit(&user, &TINY);
+
+    let account = client.get_account(&user);
+    assert_eq!(account.balance, TINY);
+}
+
+/// A deposit that lands exactly on the configured minimum succeeds.
+#[test]
+fn deposit_at_minimum_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const MIN: i128 = 10_000_000;
+    client.set_min_deposit(&MIN);
+
+    mint(&env, &token, &token_admin, &user, MIN);
+    client.deposit(&user, &MIN);
+
+    let account = client.get_account(&user);
+    assert_eq!(account.balance, MIN);
+}
+
+/// A deposit below the configured minimum is rejected, and neither tokens
+/// nor an account record are created.
+#[test]
+fn deposit_below_minimum_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const MIN: i128 = 10_000_000;
+    client.set_min_deposit(&MIN);
+
+    mint(&env, &token, &token_admin, &user, MIN);
+    let result = client.try_deposit(&user, &(MIN - 1));
+
+    assert_eq!(
+        result,
+        Err(Ok(Error::DepositBelowMinimum)),
+        "deposit below the configured minimum must be rejected",
+    );
+
+    let token_client = soroban_sdk::token::Client::new(&env, &token);
+    assert_eq!(
+        token_client.balance(&user),
+        MIN,
+        "no tokens must move on a rejected below-minimum deposit",
+    );
+
+    let account_result = client.try_get_account(&user);
+    assert!(
+        matches!(account_result, Err(Ok(Error::NotFound))),
+        "no account must be created by a rejected below-minimum deposit",
+    );
+}
+
+/// A negative minimum is rejected as an invalid amount.
+#[test]
+fn set_min_deposit_rejects_negative() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+
+    let result = client.try_set_min_deposit(&-1i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// `set_min_deposit` must require the current admin's authorization.
+#[test]
+fn set_min_deposit_without_admin_auth_rejected() {
+    let env = Env::default();
+    let (client, _admin, _token) = setup_with_token(&env);
+
+    let result = client.try_set_min_deposit(&10_000_000i128);
+
+    assert!(
+        result.is_err(),
+        "set_min_deposit must fail without the admin's authorization"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #50 — Guard withdrawals to owner address only
+// ---------------------------------------------------------------------------
+
+/// `withdraw` has no destination parameter, so the token transfer can only
+/// ever credit the authenticated `owner`. This asserts the full withdrawn
+/// amount lands on the owner's own balance and is simultaneously debited
+/// from the vault — funds cannot be redirected for a flexible (solo)
+/// account.
+#[test]
+fn flexible_withdraw_pays_out_only_to_owner() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const DEPOSIT: i128 = 40_000_000;
+    const WITHDRAW: i128 = 15_000_000;
+
+    mint(&env, &token, &token_admin, &owner, DEPOSIT);
+    client.deposit(&owner, &DEPOSIT);
+
+    let token_client = soroban_sdk::token::Client::new(&env, &token);
+    let vault_balance_before = token_client.balance(&client.address);
+    let owner_balance_before = token_client.balance(&owner);
+
+    client.withdraw(&owner, &WITHDRAW);
+
+    assert_eq!(
+        token_client.balance(&owner) - owner_balance_before,
+        WITHDRAW,
+        "the full withdrawn amount must be credited to the owner",
+    );
+    assert_eq!(
+        vault_balance_before - token_client.balance(&client.address),
+        WITHDRAW,
+        "the vault must debit exactly the withdrawn amount",
+    );
+}
+
+/// Same guarantee as above for a locked plan: `locked_withdraw` pays out
+/// only to the plan's owner.
+#[test]
+fn locked_withdraw_pays_out_only_to_owner() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const AMOUNT: i128 = 60_000_000;
+
+    mint(&env, &token, &token_admin, &owner, AMOUNT);
+
+    // `min_persistent_entry_ttl` set well above the sequence-number jump
+    // below (100 -> 200) so the `LockedPlan` entry is not archived before
+    // the withdrawal attempt — this test is about the payout destination,
+    // not persistent-entry TTL behavior.
+    let now: u64 = 1_000_000;
+    env.ledger().set(LedgerInfo {
+        timestamp: now,
+        protocol_version: 22,
+        sequence_number: 100,
+        network_id: Default::default(),
+        base_reserve: 5_000_000,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 3_110_400,
+        max_entry_ttl: 3_110_400,
+    });
+    let unlock_at = now + 1_000;
+    let plan_id = client.locked_create(&owner, &AMOUNT, &unlock_at);
+
+    env.ledger().set(LedgerInfo {
+        timestamp: unlock_at + 1,
+        protocol_version: 22,
+        sequence_number: 200,
+        network_id: Default::default(),
+        base_reserve: 5_000_000,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 3_110_400,
+        max_entry_ttl: 3_110_400,
+    });
+
+    let token_client = soroban_sdk::token::Client::new(&env, &token);
+    let owner_balance_before = token_client.balance(&owner);
+
+    client.locked_withdraw(&owner, &plan_id, &AMOUNT);
+
+    assert_eq!(
+        token_client.balance(&owner) - owner_balance_before,
+        AMOUNT,
+        "the full locked withdrawal must be credited to the plan's owner",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #51 — Contract upgrade mechanism (admin)
+// ---------------------------------------------------------------------------
+
+/// Only the admin may upgrade the contract. A non-admin caller is rejected
+/// with `Error::Unauthorized` before the Wasm swap is ever attempted, so
+/// this test can safely use a placeholder hash — `upgrade` never reaches
+/// the point of validating it against uploaded Wasm.
+#[test]
+fn upgrade_by_non_admin_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let attacker = Address::generate(&env);
+    let fake_wasm_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+
+    let result = client.try_upgrade(&attacker, &fake_wasm_hash);
+
+    assert_eq!(
+        result,
+        Err(Ok(Error::Unauthorized)),
+        "a non-admin caller must not be able to upgrade the contract",
+    );
+}
+
+/// `upgrade` must require the current admin's authorization (a signature
+/// alone is not enough — it must be the admin's signature).
+#[test]
+fn upgrade_without_admin_auth_rejected() {
+    let env = Env::default();
+    let (client, admin, _token) = setup_with_token(&env);
+    let fake_wasm_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+
+    let result = client.try_upgrade(&admin, &fake_wasm_hash);
+
+    assert!(
+        result.is_err(),
+        "upgrade must fail without the admin's authorization",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Issue #41 — Property test: split rounding sums to pool
 //
 // Weighted settlement must never create or destroy funds via rounding: for
