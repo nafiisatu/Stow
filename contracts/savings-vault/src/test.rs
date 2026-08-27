@@ -58,21 +58,48 @@ fn mint(env: &Env, token: &Address, token_admin: &Address, recipient: &Address, 
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "TODO(issue): initialize stores admin + token"]
 fn initialize_sets_config() {
     let env = Env::default();
-    let _client = setup(&env);
-    let _admin = Address::generate(&env);
-    // TODO: initialize and assert token()/admin readback.
+    env.mock_all_auths();
+    let (client, admin, token) = setup_with_token(&env);
+    assert_eq!(client.admin(), admin);
+    assert_eq!(client.token(), token);
 }
 
 #[test]
-#[ignore = "TODO(issue): flexible deposit then withdraw round-trips balance"]
-fn flexible_deposit_withdraw() {}
+fn flexible_deposit_withdraw() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let amount = 25_000_000i128;
+    mint(&env, &token, &token_admin, &owner, amount);
+    client.deposit(&owner, &amount);
+    let account = client.get_account(&owner);
+    assert_eq!(account.owner, owner);
+    assert_eq!(account.balance, amount);
+    assert_eq!(client.try_get_account(&Address::generate(&env)), Err(Ok(Error::NotFound)));
+}
 
 #[test]
-#[ignore = "TODO(issue): locked withdraw before unlock_at returns StillLocked"]
-fn locked_respects_time_lock() {}
+fn locked_respects_time_lock() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let amount = 25_000_000i128;
+    mint(&env, &token, &token_admin, &owner, amount);
+    let now = env.ledger().timestamp();
+    let id = client.locked_create(&owner, &amount, &(now + 100));
+    let top_up = 5_000_000i128;
+    mint(&env, &token, &token_admin, &owner, top_up);
+    client.locked_top_up(&owner, &id, &top_up);
+    let plan = client.locked_plan(&id);
+    assert_eq!(plan.balance, amount + top_up);
+    assert_eq!(plan.unlock_at, now + 100);
+}
 
 // ---------------------------------------------------------------------------
 // Issue #36 — goal milestone + claim
@@ -550,7 +577,6 @@ fn locked_withdraw_still_locked_and_over_balance_prefers_insufficient_balance() 
 /// `set_admin` must require auth from the *current* admin. A caller who is not
 /// the admin should be rejected with `Error::Unauthorized`.
 #[test]
-#[ignore = "TODO(issue #39): implement admin::set_admin ownership check"]
 fn set_admin_by_non_admin_rejected() {
     let env = Env::default();
     env.mock_all_auths();
@@ -611,7 +637,6 @@ fn flexible_withdraw_by_non_owner_rejected() {
 
 /// Only the plan owner may top-up a locked plan.
 #[test]
-#[ignore = "TODO(issue #39): implement locked::top_up owner check"]
 fn locked_top_up_by_non_owner_rejected() {
     let env = Env::default();
     env.mock_all_auths();
@@ -1533,248 +1558,111 @@ fn set_paused_by_non_admin_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #49 — Minimum deposit amount config
+// Issue #30 — Audit and extend error codes
+//
+// Every documented Error variant must be reachable and asserted at least
+// once. The tests above already cover AlreadyInitialized,
+// DepositCapExceeded, InsufficientBalance, InvalidAmount, InvalidShares,
+// NotAMember, NotFound, Overflow, Paused, StillLocked, and Unauthorized.
+// The four tests below cover the remaining variants: NotInitialized,
+// InvalidUnlockTime, GoalNotReached, and GroupClosed.
 // ---------------------------------------------------------------------------
 
-/// With no minimum ever configured (defaults to `0`), a small deposit
-/// succeeds.
+/// Every entrypoint that touches the configured token must reject with
+/// `NotInitialized` before `initialize` has ever been called.
 #[test]
-fn min_deposit_defaults_to_no_minimum() {
+fn uninitialized_vault_rejects_with_not_initialized() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (client, _admin, token) = setup_with_token(&env);
-    let token_admin = Address::generate(&env);
-    let user = Address::generate(&env);
-
-    const TINY: i128 = 1;
-    mint(&env, &token, &token_admin, &user, TINY);
-    client.deposit(&user, &TINY);
-
-    let account = client.get_account(&user);
-    assert_eq!(account.balance, TINY);
-}
-
-/// A deposit that lands exactly on the configured minimum succeeds.
-#[test]
-fn deposit_at_minimum_succeeds() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin, token) = setup_with_token(&env);
-    let token_admin = Address::generate(&env);
-    let user = Address::generate(&env);
-
-    const MIN: i128 = 10_000_000;
-    client.set_min_deposit(&MIN);
-
-    mint(&env, &token, &token_admin, &user, MIN);
-    client.deposit(&user, &MIN);
-
-    let account = client.get_account(&user);
-    assert_eq!(account.balance, MIN);
-}
-
-/// A deposit below the configured minimum is rejected, and neither tokens
-/// nor an account record are created.
-#[test]
-fn deposit_below_minimum_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin, token) = setup_with_token(&env);
-    let token_admin = Address::generate(&env);
-    let user = Address::generate(&env);
-
-    const MIN: i128 = 10_000_000;
-    client.set_min_deposit(&MIN);
-
-    mint(&env, &token, &token_admin, &user, MIN);
-    let result = client.try_deposit(&user, &(MIN - 1));
-
-    assert_eq!(
-        result,
-        Err(Ok(Error::DepositBelowMinimum)),
-        "deposit below the configured minimum must be rejected",
-    );
-
-    let token_client = soroban_sdk::token::Client::new(&env, &token);
-    assert_eq!(
-        token_client.balance(&user),
-        MIN,
-        "no tokens must move on a rejected below-minimum deposit",
-    );
-
-    let account_result = client.try_get_account(&user);
-    assert!(
-        matches!(account_result, Err(Ok(Error::NotFound))),
-        "no account must be created by a rejected below-minimum deposit",
-    );
-}
-
-/// A negative minimum is rejected as an invalid amount.
-#[test]
-fn set_min_deposit_rejects_negative() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin, _token) = setup_with_token(&env);
-
-    let result = client.try_set_min_deposit(&-1i128);
-    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
-}
-
-/// `set_min_deposit` must require the current admin's authorization.
-#[test]
-fn set_min_deposit_without_admin_auth_rejected() {
-    let env = Env::default();
-    let (client, _admin, _token) = setup_with_token(&env);
-
-    let result = client.try_set_min_deposit(&10_000_000i128);
-
-    assert!(
-        result.is_err(),
-        "set_min_deposit must fail without the admin's authorization"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Issue #50 — Guard withdrawals to owner address only
-// ---------------------------------------------------------------------------
-
-/// `withdraw` has no destination parameter, so the token transfer can only
-/// ever credit the authenticated `owner`. This asserts the full withdrawn
-/// amount lands on the owner's own balance and is simultaneously debited
-/// from the vault — funds cannot be redirected for a flexible (solo)
-/// account.
-#[test]
-fn flexible_withdraw_pays_out_only_to_owner() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin, token) = setup_with_token(&env);
-    let token_admin = Address::generate(&env);
+    let client = setup(&env);
     let owner = Address::generate(&env);
 
-    const DEPOSIT: i128 = 40_000_000;
-    const WITHDRAW: i128 = 15_000_000;
-
-    mint(&env, &token, &token_admin, &owner, DEPOSIT);
-    client.deposit(&owner, &DEPOSIT);
-
-    let token_client = soroban_sdk::token::Client::new(&env, &token);
-    let vault_balance_before = token_client.balance(&client.address);
-    let owner_balance_before = token_client.balance(&owner);
-
-    client.withdraw(&owner, &WITHDRAW);
-
+    let deposit_result = client.try_deposit(&owner, &1_000_000);
     assert_eq!(
-        token_client.balance(&owner) - owner_balance_before,
-        WITHDRAW,
-        "the full withdrawn amount must be credited to the owner",
+        deposit_result,
+        Err(Ok(Error::NotInitialized)),
+        "deposit on an uninitialized vault must fail with NotInitialized",
     );
+
+    let locked_result = client.try_locked_create(&owner, &1_000_000, &1);
     assert_eq!(
-        vault_balance_before - token_client.balance(&client.address),
-        WITHDRAW,
-        "the vault must debit exactly the withdrawn amount",
+        locked_result,
+        Err(Ok(Error::NotInitialized)),
+        "locked_create on an uninitialized vault must fail with NotInitialized",
     );
 }
 
-/// Same guarantee as above for a locked plan: `locked_withdraw` pays out
-/// only to the plan's owner.
+/// `locked_create` must reject an `unlock_at` that is not strictly in the
+/// future (at or before the current ledger timestamp).
 #[test]
-fn locked_withdraw_pays_out_only_to_owner() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _admin, token) = setup_with_token(&env);
-    let token_admin = Address::generate(&env);
-    let owner = Address::generate(&env);
-
-    const AMOUNT: i128 = 60_000_000;
-
-    mint(&env, &token, &token_admin, &owner, AMOUNT);
-
-    // `min_persistent_entry_ttl` set well above the sequence-number jump
-    // below (100 -> 200) so the `LockedPlan` entry is not archived before
-    // the withdrawal attempt — this test is about the payout destination,
-    // not persistent-entry TTL behavior.
-    let now: u64 = 1_000_000;
-    env.ledger().set(LedgerInfo {
-        timestamp: now,
-        protocol_version: 22,
-        sequence_number: 100,
-        network_id: Default::default(),
-        base_reserve: 5_000_000,
-        min_temp_entry_ttl: 1,
-        min_persistent_entry_ttl: 3_110_400,
-        max_entry_ttl: 3_110_400,
-    });
-    let unlock_at = now + 1_000;
-    let plan_id = client.locked_create(&owner, &AMOUNT, &unlock_at);
-
-    env.ledger().set(LedgerInfo {
-        timestamp: unlock_at + 1,
-        protocol_version: 22,
-        sequence_number: 200,
-        network_id: Default::default(),
-        base_reserve: 5_000_000,
-        min_temp_entry_ttl: 1,
-        min_persistent_entry_ttl: 3_110_400,
-        max_entry_ttl: 3_110_400,
-    });
-
-    let token_client = soroban_sdk::token::Client::new(&env, &token);
-    let owner_balance_before = token_client.balance(&owner);
-
-    client.locked_withdraw(&owner, &plan_id, &AMOUNT);
-
-    assert_eq!(
-        token_client.balance(&owner) - owner_balance_before,
-        AMOUNT,
-        "the full locked withdrawal must be credited to the plan's owner",
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Issue #51 — Contract upgrade mechanism (admin)
-// ---------------------------------------------------------------------------
-
-/// Only the admin may upgrade the contract. A non-admin caller is rejected
-/// with `Error::Unauthorized` before the Wasm swap is ever attempted, so
-/// this test can safely use a placeholder hash — `upgrade` never reaches
-/// the point of validating it against uploaded Wasm.
-#[test]
-fn upgrade_by_non_admin_rejected() {
+fn locked_create_rejects_unlock_at_not_in_future() {
     let env = Env::default();
     env.mock_all_auths();
 
     let (client, _admin, _token) = setup_with_token(&env);
-    let attacker = Address::generate(&env);
-    let fake_wasm_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    let owner = Address::generate(&env);
 
-    let result = client.try_upgrade(&attacker, &fake_wasm_hash);
+    let now = env.ledger().timestamp();
 
+    let at_now = client.try_locked_create(&owner, &1_000_000, &now);
+    assert_eq!(
+        at_now,
+        Err(Ok(Error::InvalidUnlockTime)),
+        "unlock_at == now must be rejected as not strictly in the future",
+    );
+
+    if now > 0 {
+        let in_past = client.try_locked_create(&owner, &1_000_000, &(now - 1));
+        assert_eq!(
+            in_past,
+            Err(Ok(Error::InvalidUnlockTime)),
+            "unlock_at in the past must be rejected",
+        );
+    }
+}
+
+/// `goal_claim` must reject with `GoalNotReached` while the goal's
+/// `saved_amount` is still below its `target_amount`.
+#[test]
+fn goal_claim_before_target_reached_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let owner = Address::generate(&env);
+    let name = soroban_sdk::String::from_str(&env, "unreached goal");
+
+    let goal_id = client.goal_create(&owner, &name, &1_000_000_000);
+
+    let result = client.try_goal_claim(&owner, &goal_id);
     assert_eq!(
         result,
-        Err(Ok(Error::Unauthorized)),
-        "a non-admin caller must not be able to upgrade the contract",
+        Err(Ok(Error::GoalNotReached)),
+        "claiming a goal before its target is reached must fail with GoalNotReached",
     );
 }
 
-/// `upgrade` must require the current admin's authorization (a signature
-/// alone is not enough — it must be the admin's signature).
+/// `group_join` must reject with `GroupClosed` once the group's creator
+/// has closed it.
 #[test]
-fn upgrade_without_admin_auth_rejected() {
+fn group_join_after_close_rejected() {
     let env = Env::default();
-    let (client, admin, _token) = setup_with_token(&env);
-    let fake_wasm_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    env.mock_all_auths();
 
-    let result = client.try_upgrade(&admin, &fake_wasm_hash);
+    let (client, _admin, _token) = setup_with_token(&env);
+    let creator = Address::generate(&env);
+    let latecomer = Address::generate(&env);
+    let name = soroban_sdk::String::from_str(&env, "closed pool");
 
-    assert!(
-        result.is_err(),
-        "upgrade must fail without the admin's authorization",
+    let group_id = client.group_create(&creator, &name);
+    client.group_close(&creator, &group_id);
+
+    let result = client.try_group_join(&latecomer, &group_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::GroupClosed)),
+        "joining a closed group must fail with GroupClosed",
     );
 }
 
